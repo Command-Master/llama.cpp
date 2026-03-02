@@ -3270,13 +3270,15 @@ struct llama_sampler * llama_sampler_init_dry_testing(int32_t context_size, floa
 //
 struct llama_sampler_adaptive_p {
     const float        target;            // target probability (0.0 - 1.0; negative = disabled)
-    const float        decay;             // EMA decay; history ~= 1/(1-decay) tokens (0.0 - 0.99)
+    const float        decay;              // EMA decay; history ~= 1/(1-decay) tokens (0.0 - 0.99)
+    const bool         use_logprob;       // use exp(EMA of logprobs) instead of EMA of probs
     const uint32_t     seed;              // original RNG seed
     uint32_t           seed_cur;          // actual RNG seed
     std::mt19937       rng;               // RNG state
-    float              weighted_sum;      // sum(p_i * decay^i)
+    float              weighted_sum;      // sum(p_i * decay^i) or sum(log(p_i) * decay^i)
     float              total_weight;      // sum(decay^i), converges to 1/(1-decay)
     std::vector<float> original_probs;    // pre-transform probs, cached for EMA update
+    std::vector<float> original_logprobs;  // pre-transform logprobs, cached for EMA update (when use_logprob is true)
     llama_token        pending_token_id;  // token ID of selected token
     int32_t            pending_token_idx; // index of orig. prob. of selected token in original_probs
 };
@@ -3303,18 +3305,46 @@ static void llama_sampler_adaptive_p_apply(struct llama_sampler * smpl, llama_to
         return;
     }
 
-    // store the original probabilities
-    ctx->original_probs.resize(cur_p->size);
-    for (size_t i = 0; i < cur_p->size; ++i) {
-        ctx->original_probs[i] = cur_p->data[i].p;
+    // store the original probabilities or log-probabilities for EMA depending on mode
+    if (ctx->use_logprob) {
+        ctx->original_logprobs.resize(cur_p->size);
+        for (size_t i = 0; i < cur_p->size; ++i) {
+            // Store log-probability for EMA
+            // Use log(p) after softmax, not the raw logit
+            ctx->original_logprobs[i] = cur_p->data[i].p > 0.0f ? std::log(cur_p->data[i].p) : -INFINITY;
+        }
+    } else {
+        ctx->original_probs.resize(cur_p->size);
+        for (size_t i = 0; i < cur_p->size; ++i) {
+            // Store probability for EMA
+            ctx->original_probs[i] = cur_p->data[i].p;
+        }
     }
 
-    // using the EMA, compute the adapted target probability for the current sampling step
     auto target = std::clamp(ctx->target, 0.0f, 1.0f);
-    float adapted_target = std::clamp(
-        ctx->total_weight == 0.0f ? target : 2.0f * target - (ctx->weighted_sum / ctx->total_weight),
-        0.0f, 1.0f
-    );
+    float adapted_target;
+    float log_scale_factor = 1.0f;
+
+    if (ctx->use_logprob) {
+        // Fix 1: compute adapted_target entirely in log scale
+        // Clamp target to a small positive value to safely avoid log(0)
+        float log_target = std::log(std::max(target, 1e-8f));
+        float avg_logprob = ctx->total_weight == 0.0f ? log_target : (ctx->weighted_sum / ctx->total_weight);
+
+        adapted_target = ctx->total_weight == 0.0f ? log_target : 2.0f * log_target - avg_logprob;
+        // Log-probabilities cannot exceed 0 (which corresponds to probability 1.0)
+        adapted_target = std::min(adapted_target, 0.0f);
+
+        // Calculate scaling factor to keep INV_WIDTH and SHARPNESS valid in log-space
+        log_scale_factor = std::exp(adapted_target);
+    } else {
+        // compute adapted target probability for the current sampling step
+        float moving_avg_prob = ctx->total_weight == 0.0f ? target : (ctx->weighted_sum / ctx->total_weight);
+        adapted_target = std::clamp(
+            ctx->total_weight == 0.0f ? target : 2.0f * target - moving_avg_prob,
+            0.0f, 1.0f
+        );
+    }
 
     // adaptive probability transform
     //
@@ -3328,7 +3358,27 @@ static void llama_sampler_adaptive_p_apply(struct llama_sampler * smpl, llama_to
             // (as masked out by e.g. min-p and top-p when using backend sampling)
             continue;
         }
-        float dist = std::abs((cur_p->data[i].p - adapted_target) * INV_WIDTH);
+
+        float dist;
+        if (ctx->use_logprob) {
+            float log_p = cur_p->data[i].p > 0.0f ? std::log(cur_p->data[i].p) : -INFINITY;
+
+            // If the probability underflowed to identically zero, drop the logit
+            // completely to avoid NaN errors downstream in distance metric squared.
+            if (log_p == -INFINITY) {
+                cur_p->data[i].logit = -INFINITY;
+                continue;
+            }
+
+            // Fix 2: calculation of dist happens in log scale
+            float diff = std::abs(log_p - adapted_target);
+
+            // Apply scale factor to map log-distance roughly back to linear boundaries
+            dist = diff * log_scale_factor * INV_WIDTH;
+        } else {
+            dist = std::abs(cur_p->data[i].p - adapted_target) * INV_WIDTH;
+        }
+
         cur_p->data[i].logit = PEAK_LOGIT_VALUE - SHARPNESS * dist * dist / (1.0f + dist);
     }
 
@@ -3347,8 +3397,13 @@ static void llama_sampler_adaptive_p_accept(struct llama_sampler * smpl, llama_t
     if (ctx->pending_token_id == token) {
         GGML_ASSERT(ctx->pending_token_id != LLAMA_TOKEN_NULL);
         GGML_ASSERT(ctx->pending_token_idx != -1);
-        // update EMA with the original probability of the selected token
-        ctx->weighted_sum = ctx->original_probs[ctx->pending_token_idx] + ctx->decay * ctx->weighted_sum;
+        // update EMA with the original probability (or logprob) of the selected token
+        if (ctx->use_logprob) {
+            // Use exp(moving_average(logprobs)) - store logprobs in weighted_sum
+            ctx->weighted_sum = ctx->original_logprobs[ctx->pending_token_idx] + ctx->decay * ctx->weighted_sum;
+        } else {
+            ctx->weighted_sum = ctx->original_probs[ctx->pending_token_idx] + ctx->decay * ctx->weighted_sum;
+        }
         ctx->total_weight = 1.0f + ctx->decay * ctx->total_weight;
     }
     ctx->pending_token_id = LLAMA_TOKEN_NULL;
@@ -3357,10 +3412,16 @@ static void llama_sampler_adaptive_p_accept(struct llama_sampler * smpl, llama_t
 
 static void llama_sampler_adaptive_p_reset(struct llama_sampler * smpl) {
     auto * ctx = (llama_sampler_adaptive_p *) smpl->ctx;
-    // ctx->target and ctx->decay never change after init, so it's safe to keep them as is.
+    // ctx->target, ctx->decay, and ctx->use_logprob never change after init, so it's safe to keep them as is.
     // original_probs is completely overwritten on every call to _apply.
     // so we only need to reset the EMA state and pending token.
-    ctx->weighted_sum      = ctx->target / (1.0f - ctx->decay);
+    if (ctx->use_logprob) {
+        // When using logprobs, we store log probabilities in weighted_sum
+        // Initial EMA of logprobs = log(target)
+        ctx->weighted_sum = ctx->target > 0.0f ? std::log(ctx->target) / (1.0f - ctx->decay) : 0.0f;
+    } else {
+        ctx->weighted_sum = ctx->target / (1.0f - ctx->decay);
+    }
     ctx->total_weight      = 1.0f / (1.0f - ctx->decay);
     ctx->pending_token_id  = LLAMA_TOKEN_NULL;
     ctx->pending_token_idx = -1;
@@ -3370,10 +3431,10 @@ static void llama_sampler_adaptive_p_reset(struct llama_sampler * smpl) {
 
 static struct llama_sampler * llama_sampler_adaptive_p_clone(const struct llama_sampler * smpl) {
     const auto * ctx  = (const llama_sampler_adaptive_p *) smpl->ctx;
-    auto * result     = llama_sampler_init_adaptive_p(ctx->target, ctx->decay, ctx->seed);
+    auto * result     = llama_sampler_init_adaptive_p(ctx->target, ctx->decay, ctx->seed, ctx->use_logprob);
     auto * result_ctx = (llama_sampler_adaptive_p *) result->ctx;
 
-    // copy everything (target, decay, seed, and RNG are already set)
+    // copy everything (target, decay, use_logprob, seed, and RNG are already set)
     result_ctx->weighted_sum      = ctx->weighted_sum;
     result_ctx->total_weight      = ctx->total_weight;
     result_ctx->pending_token_id  = ctx->pending_token_id;
@@ -3402,21 +3463,33 @@ static struct llama_sampler_i llama_sampler_adaptive_p_i = {
 struct llama_sampler * llama_sampler_init_adaptive_p(
     float    target,
     float    decay,
-    uint32_t seed
+    uint32_t seed,
+    bool     use_logprob
 ) {
     auto seed_cur = get_rng_seed(seed);
     float clamped_decay = std::clamp(decay, 0.0f, 0.99f);
+    float weighted_sum;
+    float total_weight = 1.0f / (1.0f - clamped_decay);
+    if (use_logprob) {
+        // When using logprobs, we store log probabilities in weighted_sum
+        // Initial EMA of logprobs = log(target)
+        weighted_sum = target > 0.0f ? std::log(target) * total_weight : 0.0f;
+    } else {
+        weighted_sum = target * total_weight;
+    }
     return llama_sampler_init(
         /* .iface = */ &llama_sampler_adaptive_p_i,
         /* .ctx   = */ new llama_sampler_adaptive_p {
             /* .target            = */ target,
             /* .decay             = */ clamped_decay,
+            /* .use_logprob       = */ use_logprob,
             /* .seed              = */ seed,
             /* .seed_cur          = */ seed_cur,
             /* .rng               = */ std::mt19937(seed_cur),
-            /* .weighted_sum      = */ target / (1.0f - clamped_decay),
-            /* .total_weight      = */ 1.0f / (1.0f - clamped_decay),
+            /* .weighted_sum      = */ weighted_sum,
+            /* .total_weight      = */ total_weight,
             /* .original_probs    = */ {},
+            /* .original_logprobs = */ {},
             /* .pending_token_id  = */ LLAMA_TOKEN_NULL,
             /* .pending_token_idx = */ -1
         }

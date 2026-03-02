@@ -1413,7 +1413,8 @@ extern "C" {
     LLAMA_API struct llama_sampler * llama_sampler_init_adaptive_p(
                                float   target,
                                float   decay,
-                            uint32_t   seed);
+                            uint32_t   seed,
+                            bool      use_logprob);
 
     LLAMA_API struct llama_sampler * llama_sampler_init_logit_bias(
                              int32_t   n_vocab,

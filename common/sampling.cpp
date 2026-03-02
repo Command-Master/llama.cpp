@@ -310,7 +310,7 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
         }
         if (use_adaptive_p) {
             // only if user explicitly included adaptive-p sampler
-            samplers.push_back(llama_sampler_init_adaptive_p(params.adaptive_target, params.adaptive_decay, params.seed));
+            samplers.push_back(llama_sampler_init_adaptive_p(params.adaptive_target, params.adaptive_decay, params.seed, params.adaptive_logprob));
         } else {
             // default: sample from distribution
             samplers.push_back(llama_sampler_init_dist(params.seed));

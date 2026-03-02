@@ -1756,6 +1756,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_sparam());
     add_opt(common_arg(
+        {"--adaptive-logprob"}, "",
+        string_format("adaptive-p: use exp(moving_average(logprobs)) instead of moving_average(probs)\n"
+                      "(default: %s)\n"
+                      "  This mode emphasizes tokens with consistently high log-probabilities\n"
+                      "  rather than tokens with high raw probabilities, leading to more\n"
+                      "  deterministic sampling.",
+                      params.sampling.adaptive_logprob ? "enabled" : "disabled"),
+        [](common_params & params, const std::string & /*value*/) {
+            params.sampling.adaptive_logprob = true;
+        }
+    ));
+    add_opt(common_arg(
         {"--dynatemp-range"}, "N",
         string_format("dynamic temperature range (default: %.2f, 0.0 = disabled)", (double)params.sampling.dynatemp_range),
         [](common_params & params, const std::string & value) {
